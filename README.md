@@ -6,7 +6,7 @@ This is a pet project, written with Claude Code.
 
 ## Demo
 
-<!-- Paste your video URL here after uploading through GitHub's web interface -->
+https://github.com/user-attachments/assets/afdc5943-5e51-462b-a287-0ff629da57c3
 
 ## Features
 
@@ -15,6 +15,8 @@ This is a pet project, written with Claude Code.
 - Real-time transmission mode
 - TX/RX/CD LED indicators
 - WebSocket-based communication
+
+
 
 ## Requirements
 
