@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Dial-up Modem Emulator</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div class="container">
+        <div class="monitor sender">
+            <div class="bezel">
+                <div class="screen-frame">
+                    <div class="screen">
+                        <div class="scanlines"></div>
+                        <div class="screen-content">
+                            <textarea id="input" placeholder="Type your message here..." spellcheck="false"></textarea>
+                        </div>
+                    </div>
+                </div>
+                <div class="controls">
+                    <div class="led-container">
+                        <div class="led" id="tx-led"></div>
+                        <span class="led-label">TX</span>
+                    </div>
+                    <button id="send-btn">SEND</button>
+                    <div class="mode-toggle">
+                        <label>
+                            <input type="checkbox" id="realtime-mode">
+                            <span>Real-time</span>
+                        </label>
+                    </div>
+                </div>
+            </div>
+            <div class="label">SENDER</div>
+        </div>
+
+        <div class="monitor receiver">
+            <div class="bezel">
+                <div class="screen-frame">
+                    <div class="screen">
+                        <div class="scanlines"></div>
+                        <div class="screen-content">
+                            <div id="output"><span class="cursor"></span></div>
+                        </div>
+                    </div>
+                </div>
+                <div class="controls">
+                    <div class="led-container">
+                        <div class="led" id="rx-led"></div>
+                        <span class="led-label">RX</span>
+                    </div>
+                    <div class="led-container">
+                        <div class="led" id="cd-led"></div>
+                        <span class="led-label">CD</span>
+                    </div>
+                    <button id="clear-btn">CLEAR</button>
+                </div>
+            </div>
+            <div class="label">RECEIVER</div>
+        </div>
+    </div>
+
+    <div class="status-bar">
+        <span id="connection-status">Disconnected</span>
+        <span id="protocol-info">Bell 202 | 1200 baud | 8-N-1</span>
+    </div>
+
+    <script src="/static/bell202.js"></script>
+    <script src="/static/app.js"></script>
+</body>
+</html>
