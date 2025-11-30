@@ -6,9 +6,7 @@ This is a pet project, written with Claude Code.
 
 ## Demo
 
-https://github.com/user-attachments/assets/sounds_of_dialup_v0.1_demo.mp4
-
-[View Demo Video](docs/sounds_of_dialup_v0.1_demo.mp4)
+<!-- Paste your video URL here after uploading through GitHub's web interface -->
 
 ## Features
 
