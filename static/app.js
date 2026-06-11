@@ -12,6 +12,7 @@ class DialupEmulator {
         this.output = document.getElementById('output');
         this.sendBtn = document.getElementById('send-btn');
         this.clearBtn = document.getElementById('clear-btn');
+        this.hangupBtn = document.getElementById('hangup-btn');
         this.realtimeMode = document.getElementById('realtime-mode');
         this.txLed = document.getElementById('tx-led');
         this.rxLed = document.getElementById('rx-led');
@@ -59,6 +60,36 @@ class DialupEmulator {
                 this.cdLed.classList.remove('carrier');
             }
         };
+
+        this.modem.onConnectionStatus = (status) => {
+            this.updateConnectionDisplay(status);
+        };
+    }
+
+    updateConnectionDisplay(status) {
+        const statusMessages = {
+            'dialTone': 'DIAL TONE...',
+            'dialing': 'DIALING...',
+            'ringing': 'RINGING...',
+            'negotiating': 'NEGOTIATING...',
+            'connected': 'CONNECTED @ 1200 BPS',
+            'disconnected': 'DISCONNECTED'
+        };
+
+        const message = statusMessages[status] || status;
+        this.connectionStatus.textContent = message;
+
+        // Visual feedback for different states
+        if (status === 'connected') {
+            this.connectionStatus.classList.add('connected');
+            this.cdLed.classList.add('carrier');
+        } else if (status === 'disconnected') {
+            this.connectionStatus.classList.remove('connected');
+            this.cdLed.classList.remove('carrier');
+        } else {
+            // During dial-up sequence
+            this.connectionStatus.classList.remove('connected');
+        }
     }
 
     setupEventListeners() {
@@ -69,6 +100,12 @@ class DialupEmulator {
 
         // Clear button
         this.clearBtn.addEventListener('click', () => {
+            this.clearOutput();
+        });
+
+        // Hang up button - disconnects modem so next transmission does handshake
+        this.hangupBtn.addEventListener('click', () => {
+            this.modem.disconnect();
             this.clearOutput();
         });
 
