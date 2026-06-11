@@ -10,10 +10,11 @@ https://github.com/user-attachments/assets/afdc5943-5e51-462b-a287-0ff629da57c3
 
 ## Features
 
-- Bell 202 modem audio emulation at 1200 baud
+- Bell 202 modem audio emulation at 1200 baud (8-N-1)
+- Full dial-up handshake: dial tone, DTMF dialing, ringback, and V.34 negotiation screech
 - Retro CRT monitor-style interface with scanlines
 - Real-time transmission mode
-- TX/RX/CD LED indicators
+- TX/RX/CD LED indicators and separate link / line status
 - WebSocket-based communication
 
 
@@ -49,3 +50,13 @@ The application consists of:
 - A retro-styled interface mimicking vintage terminal monitors
 
 Type a message in the sender terminal and click SEND (or enable real-time mode) to hear the modem sounds as your message is transmitted and received.
+
+## Tests
+
+The browser DSP engine has a dependency-free test suite (requires Node 18+) covering
+8-N-1 framing, a Goertzel-based demodulation round-trip, clipping limits, and the
+dial-up sequence:
+
+```bash
+node --test
+```

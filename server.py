@@ -3,7 +3,7 @@ Dial-up Modem Emulator - FastAPI Server
 Serves the web app and handles WebSocket communication for modem simulation.
 """
 
-from fastapi import FastAPI, WebSocket
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 import json
@@ -30,17 +30,21 @@ async def websocket_endpoint(websocket: WebSocket):
     try:
         while True:
             data = await websocket.receive_text()
-            message = json.loads(data)
 
-            if message["type"] == "transmit":
-                # Echo back the data to be "received"
-                # In future, this could route to another connected client
+            try:
+                message = json.loads(data)
+            except json.JSONDecodeError:
+                continue  # ignore malformed frames
+
+            if message.get("type") == "transmit":
+                # Echo back the data to be "received".
+                # In future, this could route to another connected client.
                 await websocket.send_text(json.dumps({
                     "type": "receive",
-                    "data": message["data"]
+                    "data": message.get("data", "")
                 }))
-    except Exception:
-        pass  # Client disconnected
+    except WebSocketDisconnect:
+        pass  # Client disconnected cleanly
 
 
 if __name__ == "__main__":

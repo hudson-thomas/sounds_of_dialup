@@ -256,8 +256,16 @@ button:active {
     color: #555;
 }
 
-#connection-status {
+#link-status {
     color: #ff4444;
+}
+
+#link-status.online {
+    color: #44ff44;
+}
+
+#connection-status {
+    color: #888;
 }
 
 #connection-status.connected {

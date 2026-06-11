@@ -17,7 +17,8 @@ class DialupEmulator {
         this.txLed = document.getElementById('tx-led');
         this.rxLed = document.getElementById('rx-led');
         this.cdLed = document.getElementById('cd-led');
-        this.connectionStatus = document.getElementById('connection-status');
+        this.linkStatus = document.getElementById('link-status');        // WebSocket transport
+        this.connectionStatus = document.getElementById('connection-status');  // modem line state
 
         // Modem
         this.modem = new Bell202Modem();
@@ -103,8 +104,10 @@ class DialupEmulator {
             this.clearOutput();
         });
 
-        // Hang up button - disconnects modem so next transmission does handshake
+        // Hang up button - aborts any in-flight transmission, drops the line, and
+        // clears the queue so the next message redials the full handshake.
         this.hangupBtn.addEventListener('click', () => {
+            this.transmitQueue = [];
             this.modem.disconnect();
             this.clearOutput();
         });
@@ -138,14 +141,14 @@ class DialupEmulator {
 
         this.ws.onopen = () => {
             this.isConnected = true;
-            this.connectionStatus.textContent = 'Connected';
-            this.connectionStatus.classList.add('connected');
+            this.linkStatus.textContent = 'ONLINE';
+            this.linkStatus.classList.add('online');
         };
 
         this.ws.onclose = () => {
             this.isConnected = false;
-            this.connectionStatus.textContent = 'Disconnected';
-            this.connectionStatus.classList.remove('connected');
+            this.linkStatus.textContent = 'OFFLINE';
+            this.linkStatus.classList.remove('online');
 
             // Attempt reconnection after delay
             setTimeout(() => this.connectWebSocket(), 3000);

@@ -1,0 +1,9 @@
+{
+  "name": "sounds-of-dialup",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Bell 202 modem emulator — front-end DSP tests",
+  "scripts": {
+    "test": "node --test"
+  }
+}

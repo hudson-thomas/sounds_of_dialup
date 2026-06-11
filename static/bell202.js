@@ -1,20 +1,40 @@
 /**
  * Bell 202 Modem Audio Generator
  *
- * Implements authentic Bell 202 FSK modulation using Web Audio API.
+ * Implements authentic Bell 202 FSK modulation using the Web Audio API,
+ * plus a stylised V.34 dial-up handshake (dial tone, DTMF, ringback,
+ * negotiation screech) for the full "connecting" experience.
  *
  * Specifications:
  * - Mark (1): 1200 Hz
  * - Space (0): 2200 Hz
- * - Baud rate: 1200 bps
- * - Bit duration: 833.33 microseconds
+ * - Baud rate: 1200 bps  (bit duration 833.33 us)
  * - Encoding: 8-N-1 (8 data bits, no parity, 1 stop bit)
  *
  * Handshake sequence (per Bellcore Caller ID spec):
  * 1. Channel seizure: 250ms of alternating 01010101 (300 bits)
  * 2. Mark preamble: 130ms of continuous 1200 Hz
  * 3. Data transmission
+ *
+ * Architecture notes:
+ * - The FSK data path renders through renderTones() in a single tight pass
+ *   with continuous phase (no per-bit allocation, no clicks).
+ * - Every other waveform is built on the fill() / oscillator primitives, then
+ *   the dial-up composite is edge-faded and soft-limited so it never clips.
+ * - Playback timing is driven off audioContext.currentTime (see transmit()),
+ *   not setTimeout, so character display stays locked to the audio.
  */
+
+const TWO_PI = 2 * Math.PI;
+
+// Animation-frame helpers with a non-browser fallback (so the module can be
+// imported in Node for testing without a DOM).
+const requestFrame = (typeof requestAnimationFrame !== 'undefined')
+    ? requestAnimationFrame.bind(globalThis)
+    : (fn) => setTimeout(() => fn(), 16);
+const cancelFrame = (typeof cancelAnimationFrame !== 'undefined')
+    ? cancelAnimationFrame.bind(globalThis)
+    : clearTimeout;
 
 class Bell202Modem {
     constructor() {
@@ -28,12 +48,12 @@ class Bell202Modem {
         // Timing
         this.BAUD_RATE = 1200;
         this.BIT_DURATION = 1 / this.BAUD_RATE;  // 833.33 microseconds
+        this.TRAILING_MARK_DURATION = 0.050;     // brief carrier sustain after data
 
         // Handshake timing (Bellcore spec)
         this.CHANNEL_SEIZURE_BITS = 300;        // 250ms at 1200 baud
         this.MARK_PREAMBLE_DURATION = 0.130;    // 130ms
 
-        // Dial-up sequence frequencies
         // Dial tone: North American standard
         this.DIAL_TONE_FREQ1 = 350;
         this.DIAL_TONE_FREQ2 = 440;
@@ -54,8 +74,6 @@ class Bell202Modem {
 
         // Modem negotiation frequencies
         this.ANSWER_TONE_FREQ = 2100;           // ITU-T V.25 answer tone
-        this.V21_ORIGINATE_MARK = 1270;         // V.21 originate channel
-        this.V21_ORIGINATE_SPACE = 1070;
         this.V21_ANSWER_MARK = 2225;            // V.21 answer channel
         this.V21_ANSWER_SPACE = 2025;
 
@@ -67,12 +85,22 @@ class Bell202Modem {
         this.RINGBACK_OFF_DURATION = 4.0;       // 4 seconds off
         this.RING_CYCLES = 1;                   // Number of ring cycles
         this.ANSWER_TONE_DURATION = 2.5;        // 2.5 seconds of answer tone
-        this.NEGOTIATION_DURATION = 3.0;        // 3 seconds of negotiation
+
+        // Anti-click fade applied to each dial-up segment boundary
+        this.SEGMENT_FADE_DURATION = 0.005;     // 5ms raised-cosine ramp
 
         // State
         this.isTransmitting = false;
         this.isConnected = false;       // Has the dial-up handshake completed?
-        this.phase = 0;  // For phase-continuous FSK
+        this.phase = 0;                 // Continuous phase for FSK data
+        this._rngState = 0x2545f491;    // Seeded RNG (deterministic line probing)
+
+        // Active-playback handles (so stop() can truly interrupt)
+        this._activeSource = null;
+        this._activeResolve = null;
+        this._frameId = null;
+        this._events = null;
+        this._eventIndex = 0;
 
         // Callbacks
         this.onTransmitStart = null;
@@ -82,7 +110,7 @@ class Bell202Modem {
     }
 
     /**
-     * Initialize audio context (must be called from user gesture)
+     * Initialize audio context (must be called from a user gesture)
      */
     async init() {
         if (!this.audioContext) {
@@ -96,430 +124,316 @@ class Bell202Modem {
         return this;
     }
 
-    /**
-     * Generate samples for a tone at given frequency, maintaining phase continuity
-     */
-    generateToneSamples(frequency, duration) {
-        const numSamples = Math.round(duration * this.sampleRate);
-        const samples = new Float32Array(numSamples);
-        const angularFreq = 2 * Math.PI * frequency / this.sampleRate;
+    // ---- Low-level synthesis primitives -------------------------------------
 
-        for (let i = 0; i < numSamples; i++) {
-            samples[i] = Math.sin(this.phase);
-            this.phase += angularFreq;
-        }
+    /** Sample count for a duration in seconds. */
+    samples(duration) {
+        return Math.round(duration * this.sampleRate);
+    }
 
-        // Keep phase in reasonable range to avoid floating point issues
-        this.phase = this.phase % (2 * Math.PI);
-
-        return samples;
+    /** Angular frequency (radians/sample) for a frequency in Hz. */
+    omega(freq) {
+        return TWO_PI * freq / this.sampleRate;
     }
 
     /**
-     * Render a list of FSK tone segments into a single buffer in one pass.
-     * Each segment is {freq, duration}. Phase is carried continuously across
-     * segments (this.phase) so there are no discontinuities between tones.
-     *
-     * This avoids allocating a separate Float32Array per bit and the repeated
-     * concatenation passes the old per-bit/per-byte helpers required.
+     * Allocate `n` samples and fill them from a per-sample function fn(i) -> value.
+     * This is the single oscillator loop every non-FSK waveform is built on.
+     */
+    fill(n, fn) {
+        const out = new Float32Array(n);
+        for (let i = 0; i < n; i++) {
+            out[i] = fn(i);
+        }
+        return out;
+    }
+
+    /** Deterministic PRNG in [0, 1) (mulberry32) — keeps line probing reproducible. */
+    random() {
+        this._rngState = (this._rngState + 0x6d2b79f5) | 0;
+        let t = this._rngState;
+        t = Math.imul(t ^ (t >>> 15), 1 | t);
+        t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    }
+
+    /** Raised-cosine fade on both edges of a buffer (mutates and returns it). */
+    fadeEdges(buffer, fadeSamples) {
+        const f = Math.min(fadeSamples, buffer.length >> 1);
+        for (let i = 0; i < f; i++) {
+            const gain = 0.5 * (1 - Math.cos(Math.PI * i / f));
+            buffer[i] *= gain;
+            buffer[buffer.length - 1 - i] *= gain;
+        }
+        return buffer;
+    }
+
+    /**
+     * Soft limiter (tanh knee above a threshold) — guarantees |sample| < 1 while
+     * leaving quiet passages untouched. Used on summed signals that would
+     * otherwise clip (e.g. the 21-tone line probe).
+     */
+    softLimit(buffer, threshold = 0.8) {
+        const range = 1 - threshold;
+        for (let i = 0; i < buffer.length; i++) {
+            const x = buffer[i];
+            if (x > threshold) {
+                buffer[i] = threshold + range * Math.tanh((x - threshold) / range);
+            } else if (x < -threshold) {
+                buffer[i] = -threshold + range * Math.tanh((x + threshold) / range);
+            }
+        }
+        return buffer;
+    }
+
+    /** Generate samples for a pure tone (independent phase). */
+    generateToneSamples(frequency, duration) {
+        const w = this.omega(frequency);
+        return this.fill(this.samples(duration), (i) => Math.sin(w * i));
+    }
+
+    /** Generate dual-tone samples (dial tone, ringback, DTMF). */
+    generateDualToneSamples(freq1, freq2, duration, amplitude = 0.5) {
+        const w1 = this.omega(freq1);
+        const w2 = this.omega(freq2);
+        return this.fill(this.samples(duration),
+            (i) => amplitude * (Math.sin(w1 * i) + Math.sin(w2 * i)));
+    }
+
+    /** Generate silence. */
+    generateSilence(duration) {
+        return new Float32Array(this.samples(duration));
+    }
+
+    // ---- Dial-up sequence components ----------------------------------------
+
+    /** Dial tone (350 Hz + 440 Hz). */
+    generateDialTone(duration = this.DIAL_TONE_DURATION) {
+        return this.generateDualToneSamples(
+            this.DIAL_TONE_FREQ1, this.DIAL_TONE_FREQ2, duration, 0.3);
+    }
+
+    /** DTMF tone for a single digit. */
+    generateDTMFDigit(digit) {
+        const mapping = this.DTMF_MAP[digit];
+        if (!mapping) return this.generateSilence(this.DTMF_TONE_DURATION);
+        return this.generateDualToneSamples(
+            this.DTMF_ROW[mapping[0]], this.DTMF_COL[mapping[1]],
+            this.DTMF_TONE_DURATION, 0.4);
+    }
+
+    /** DTMF sequence for a phone number. */
+    generateDTMFSequence(phoneNumber) {
+        const parts = [];
+        for (const digit of phoneNumber) {
+            if (this.DTMF_MAP[digit]) {
+                parts.push(this.generateDTMFDigit(digit));
+                parts.push(this.generateSilence(this.DTMF_PAUSE_DURATION));
+            }
+        }
+        return this.concatenateSamples(parts);
+    }
+
+    /** Ringback tone with proper cadence (2s on, 4s off). */
+    generateRingback(cycles = this.RING_CYCLES) {
+        const parts = [];
+        for (let i = 0; i < cycles; i++) {
+            parts.push(this.generateDualToneSamples(
+                this.RINGBACK_FREQ1, this.RINGBACK_FREQ2,
+                this.RINGBACK_ON_DURATION, 0.3));
+            if (i < cycles - 1) {
+                parts.push(this.generateSilence(this.RINGBACK_OFF_DURATION));
+            }
+        }
+        return this.concatenateSamples(parts);
+    }
+
+    /**
+     * ANSam answer tone: 2100 Hz with 15 Hz amplitude modulation and a 180°
+     * phase reversal every 450ms (ITU-T V.8). The characteristic "warble".
+     */
+    generateAnswerTone(duration = this.ANSWER_TONE_DURATION) {
+        const wc = this.omega(this.ANSWER_TONE_FREQ);
+        const wm = this.omega(15);
+        const rev = this.samples(0.45);
+        const depth = 0.2;  // 20% modulation depth per ITU-T
+        return this.fill(this.samples(duration), (i) => {
+            const am = 1 - depth + depth * Math.sin(wm * i);
+            const reversal = Math.PI * Math.floor(i / rev);
+            return 0.4 * am * Math.sin(wc * i + reversal);
+        });
+    }
+
+    /** Pure tone with periodic 180° phase reversals (V.34 A/B signals). */
+    generateToneWithPhaseReversals(freq, duration, reversalInterval = 0.45) {
+        const w = this.omega(freq);
+        const rev = this.samples(reversalInterval);
+        return this.fill(this.samples(duration),
+            (i) => 0.4 * Math.sin(w * i + Math.PI * Math.floor(i / rev)));
+    }
+
+    /** V.21 low-channel handshake FSK (300 baud, answer channel), phase-continuous. */
+    generateV21Handshake(duration = 0.5) {
+        const samplesPerBit = this.samples(1 / 300);
+        const wMark = this.omega(this.V21_ANSWER_MARK);
+        const wSpace = this.omega(this.V21_ANSWER_SPACE);
+        const numBits = Math.round(duration * 300);
+        let phase = 0;
+        return this.fill(numBits * samplesPerBit, (i) => {
+            const bit = Math.floor(i / samplesPerBit);
+            phase += (bit % 2 === 0) ? wMark : wSpace;
+            return 0.5 * Math.sin(phase);
+        });
+    }
+
+    /** Advance a 15-bit LFSR scrambler (V.34 style, taps 15/14). */
+    scrambleBit(lfsr) {
+        const bit = ((lfsr >> 14) ^ (lfsr >> 13)) & 1;
+        return ((lfsr << 1) | bit) & 0x7FFF;
+    }
+
+    /** V.34 line probing: 21 tones spread across the telephone band (~150–3750 Hz). */
+    generateLineProbing(duration = 0.5) {
+        const tones = Array.from({ length: 21 }, (_, i) => this.omega(150 + i * 171));
+        const phases = tones.map(() => this.random() * TWO_PI);
+        return this.fill(this.samples(duration), (i) => {
+            let sample = 0;
+            for (let t = 0; t < tones.length; t++) {
+                sample += Math.sin(phases[t] + tones[t] * i);
+            }
+            return 0.08 * sample;
+        });
+    }
+
+    /** Scrambled QAM-like training tone (the "screech") at a given carrier. */
+    generateScrambledTraining(duration, carrierFreq, symbolRate = 2400) {
+        const w = this.omega(carrierFreq);
+        const samplesPerSymbol = Math.round(this.sampleRate / symbolRate);
+        let lfsr = 0x5A5A;
+        let symbolPhase = 0;
+        return this.fill(this.samples(duration), (i) => {
+            if (i % samplesPerSymbol === 0) {
+                lfsr = this.scrambleBit(lfsr);
+                symbolPhase = ((lfsr & 0x7) / 8) * TWO_PI;  // 8-PSK style steps
+            }
+            return 0.4 * Math.sin(w * i + symbolPhase);
+        });
+    }
+
+    /**
+     * V.34 modem negotiation sequence (ITU-T V.34 phases, stylised for sound).
+     */
+    generateModemNegotiation() {
+        return [
+            // Phase 1: ANSam answer tone (warbly 2100 Hz)
+            this.generateAnswerTone(2.0),
+            // Phase 2: V.21 capability exchange
+            this.generateV21Handshake(0.2),
+            this.generateSilence(0.05),
+            // Phase 2: INFO sequences (low-pitched warble)
+            this.generateScrambledTraining(0.3, 600, 600),
+            // Phase 2: L1/L2 line probing (harsh broadband)
+            this.generateLineProbing(0.8),
+            // Phase 2: A signal (2400 Hz) and B signal (1200 Hz) with reversals
+            this.generateToneWithPhaseReversals(2400, 0.3),
+            this.generateToneWithPhaseReversals(1200, 0.2),
+            // Phase 3: equalizer training — the main screech
+            this.generateScrambledTraining(1.5, 1800, 3000),
+            // Phase 4: final training at higher symbol rate
+            this.generateScrambledTraining(0.8, 1800, 3200),
+            // Final J pattern / sync
+            this.generateToneSamples(1800, 0.1),
+            this.generateSilence(0.05)
+        ];
+    }
+
+    /**
+     * Build the complete dial-up connection sequence.
+     * Returns { samples, events, totalDuration }. Each segment is edge-faded to
+     * remove boundary clicks and the whole thing is soft-limited so it can't clip.
+     */
+    generateDialupSequence(phoneNumber = '5551234') {
+        const fade = this.samples(this.SEGMENT_FADE_DURATION);
+        const segments = [];
+        const events = [];
+        let time = 0;
+
+        const push = (buffer) => segments.push(this.fadeEdges(buffer, fade));
+        const wait = (buffer) => { push(buffer); time += buffer.length / this.sampleRate; };
+
+        // 1. Dial tone
+        events.push({ type: 'dialTone', time });
+        wait(this.generateDialTone());
+
+        // 2. DTMF dialing
+        events.push({ type: 'dialing', time });
+        wait(this.generateDTMFSequence(phoneNumber));
+        wait(this.generateSilence(0.5));
+
+        // 3. Ringback
+        events.push({ type: 'ringing', time });
+        wait(this.generateRingback());
+        wait(this.generateSilence(0.3));
+
+        // 4. Modem negotiation
+        events.push({ type: 'negotiating', time });
+        for (const part of this.generateModemNegotiation()) {
+            wait(part);
+        }
+
+        // 5. Connected
+        events.push({ type: 'connected', time });
+
+        const samples = this.softLimit(this.concatenateSamples(segments));
+        return { samples, events, totalDuration: time };
+    }
+
+    // ---- FSK data path ------------------------------------------------------
+
+    /**
+     * Encode a single byte using 8-N-1 format.
+     * Returns 10 bits: [start, d0..d7 (LSB first), stop].
+     */
+    encodeByte(byte) {
+        const bits = [0];                       // start bit (space)
+        for (let i = 0; i < 8; i++) {
+            bits.push((byte >> i) & 1);
+        }
+        bits.push(1);                           // stop bit (mark)
+        return bits;
+    }
+
+    /**
+     * Render a list of FSK tone segments ({freq, duration}) into one buffer in a
+     * single pass. Phase is carried continuously across segments so there are no
+     * discontinuities — and no per-bit allocation.
      */
     renderTones(segments) {
-        const lengths = segments.map(s => Math.round(s.duration * this.sampleRate));
+        const lengths = segments.map((s) => this.samples(s.duration));
         const total = lengths.reduce((sum, n) => sum + n, 0);
         const out = new Float32Array(total);
 
         let offset = 0;
         for (let s = 0; s < segments.length; s++) {
-            const angularFreq = 2 * Math.PI * segments[s].freq / this.sampleRate;
+            const w = this.omega(segments[s].freq);
             for (let i = 0; i < lengths[s]; i++) {
                 out[offset++] = Math.sin(this.phase);
-                this.phase += angularFreq;
+                this.phase += w;
             }
-            // Keep phase bounded to avoid floating point growth over long runs
-            this.phase %= 2 * Math.PI;
+            this.phase %= TWO_PI;  // keep phase bounded over long runs
         }
-
         return out;
     }
 
     /**
-     * Generate dual-tone samples (for dial tone, ringback, DTMF)
-     */
-    generateDualToneSamples(freq1, freq2, duration, amplitude = 0.5) {
-        const numSamples = Math.round(duration * this.sampleRate);
-        const samples = new Float32Array(numSamples);
-        const angularFreq1 = 2 * Math.PI * freq1 / this.sampleRate;
-        const angularFreq2 = 2 * Math.PI * freq2 / this.sampleRate;
-
-        for (let i = 0; i < numSamples; i++) {
-            // Combine two sine waves at half amplitude each
-            samples[i] = amplitude * (Math.sin(i * angularFreq1) + Math.sin(i * angularFreq2));
-        }
-
-        return samples;
-    }
-
-    /**
-     * Generate silence
-     */
-    generateSilence(duration) {
-        const numSamples = Math.round(duration * this.sampleRate);
-        return new Float32Array(numSamples);
-    }
-
-    /**
-     * Generate dial tone (350 Hz + 440 Hz)
-     */
-    generateDialTone(duration = null) {
-        duration = duration || this.DIAL_TONE_DURATION;
-        return this.generateDualToneSamples(
-            this.DIAL_TONE_FREQ1,
-            this.DIAL_TONE_FREQ2,
-            duration,
-            0.3
-        );
-    }
-
-    /**
-     * Generate DTMF tone for a single digit
-     */
-    generateDTMFDigit(digit) {
-        const mapping = this.DTMF_MAP[digit];
-        if (!mapping) return this.generateSilence(this.DTMF_TONE_DURATION);
-
-        const freq1 = this.DTMF_ROW[mapping[0]];
-        const freq2 = this.DTMF_COL[mapping[1]];
-
-        return this.generateDualToneSamples(freq1, freq2, this.DTMF_TONE_DURATION, 0.4);
-    }
-
-    /**
-     * Generate DTMF sequence for a phone number
-     */
-    generateDTMFSequence(phoneNumber) {
-        const allSamples = [];
-
-        for (const digit of phoneNumber) {
-            if (this.DTMF_MAP[digit]) {
-                allSamples.push(this.generateDTMFDigit(digit));
-                allSamples.push(this.generateSilence(this.DTMF_PAUSE_DURATION));
-            }
-        }
-
-        return this.concatenateSamples(allSamples);
-    }
-
-    /**
-     * Generate ringback tone with proper cadence (2s on, 4s off)
-     */
-    generateRingback(cycles = null) {
-        cycles = cycles || this.RING_CYCLES;
-        const allSamples = [];
-
-        for (let i = 0; i < cycles; i++) {
-            // Ring on
-            allSamples.push(this.generateDualToneSamples(
-                this.RINGBACK_FREQ1,
-                this.RINGBACK_FREQ2,
-                this.RINGBACK_ON_DURATION,
-                0.3
-            ));
-            // Ring off (silence) - skip on last cycle
-            if (i < cycles - 1) {
-                allSamples.push(this.generateSilence(this.RINGBACK_OFF_DURATION));
-            }
-        }
-
-        return this.concatenateSamples(allSamples);
-    }
-
-    /**
-     * Generate ANSam tone (2100 Hz with 15 Hz amplitude modulation + phase reversals)
-     * This is the proper ITU-T V.8 answer tone
-     */
-    generateAnswerTone(duration = null) {
-        duration = duration || this.ANSWER_TONE_DURATION;
-        const numSamples = Math.round(duration * this.sampleRate);
-        const samples = new Float32Array(numSamples);
-
-        const carrierFreq = this.ANSWER_TONE_FREQ;
-        const amFreq = 15;  // 15 Hz amplitude modulation
-        const amDepth = 0.2;  // 20% modulation depth per ITU-T
-
-        // Phase reversal every 450ms
-        const reversalInterval = Math.round(0.45 * this.sampleRate);
-        let phase = 0;
-        let phaseOffset = 0;
-
-        for (let i = 0; i < numSamples; i++) {
-            // Check for phase reversal
-            if (i > 0 && i % reversalInterval === 0) {
-                phaseOffset += Math.PI;  // 180° phase reversal
-            }
-
-            // Amplitude modulation envelope
-            const amEnvelope = 1 - amDepth + amDepth * Math.sin(2 * Math.PI * amFreq * i / this.sampleRate);
-
-            phase += 2 * Math.PI * carrierFreq / this.sampleRate;
-            samples[i] = 0.4 * amEnvelope * Math.sin(phase + phaseOffset);
-        }
-
-        return samples;
-    }
-
-    /**
-     * Generate pure tone with phase reversals (for A/B signals)
-     */
-    generateToneWithPhaseReversals(freq, duration, reversalInterval = 0.45) {
-        const numSamples = Math.round(duration * this.sampleRate);
-        const samples = new Float32Array(numSamples);
-        const reversalSamples = Math.round(reversalInterval * this.sampleRate);
-
-        let phase = 0;
-        let phaseOffset = 0;
-
-        for (let i = 0; i < numSamples; i++) {
-            if (i > 0 && i % reversalSamples === 0) {
-                phaseOffset += Math.PI;
-            }
-            phase += 2 * Math.PI * freq / this.sampleRate;
-            samples[i] = 0.4 * Math.sin(phase + phaseOffset);
-        }
-
-        return samples;
-    }
-
-    /**
-     * Generate V.21 handshake tones (low-speed channel establishment)
-     */
-    generateV21Handshake(duration = 0.5) {
-        const allSamples = [];
-        const bitDuration = 1 / 300; // V.21 is 300 baud
-
-        // Generate alternating pattern on answer channel
-        const numBits = Math.round(duration / bitDuration);
-        for (let i = 0; i < numBits; i++) {
-            const freq = (i % 2 === 0) ? this.V21_ANSWER_MARK : this.V21_ANSWER_SPACE;
-            const numSamples = Math.round(bitDuration * this.sampleRate);
-            const samples = new Float32Array(numSamples);
-            const angularFreq = 2 * Math.PI * freq / this.sampleRate;
-
-            for (let j = 0; j < numSamples; j++) {
-                samples[j] = 0.5 * Math.sin(this.phase);
-                this.phase += angularFreq;
-            }
-            this.phase = this.phase % (2 * Math.PI);
-            allSamples.push(samples);
-        }
-
-        return this.concatenateSamples(allSamples);
-    }
-
-    /**
-     * Simple pseudo-random number generator (for deterministic scrambling)
-     */
-    scrambleBit(lfsr) {
-        // 15-bit LFSR with taps at 15 and 14 (V.34 style scrambler)
-        const bit = ((lfsr >> 14) ^ (lfsr >> 13)) & 1;
-        return ((lfsr << 1) | bit) & 0x7FFF;
-    }
-
-    /**
-     * Generate V.34 line probing signal - 21 tones across the spectrum
-     */
-    generateLineProbing(duration = 0.5) {
-        const numSamples = Math.round(duration * this.sampleRate);
-        const samples = new Float32Array(numSamples);
-
-        // V.34 probing uses tones from ~150 Hz to ~3750 Hz
-        // 21 tones spaced across the telephone bandwidth
-        const probeTones = [];
-        for (let i = 0; i < 21; i++) {
-            probeTones.push(150 + i * 171);  // ~150 to ~3750 Hz
-        }
-
-        const phases = probeTones.map(() => Math.random() * 2 * Math.PI);
-
-        for (let i = 0; i < numSamples; i++) {
-            let sample = 0;
-            for (let t = 0; t < probeTones.length; t++) {
-                phases[t] += 2 * Math.PI * probeTones[t] / this.sampleRate;
-                sample += Math.sin(phases[t]);
-            }
-            samples[i] = 0.08 * sample;
-        }
-
-        return samples;
-    }
-
-    /**
-     * Generate scrambled training - QAM-like signal at given carrier
-     */
-    generateScrambledTraining(duration, carrierFreq, symbolRate = 2400) {
-        const numSamples = Math.round(duration * this.sampleRate);
-        const samples = new Float32Array(numSamples);
-        const samplesPerSymbol = Math.round(this.sampleRate / symbolRate);
-
-        let lfsr = 0x5A5A;
-        let phase = 0;
-        let currentPhase = 0;
-
-        for (let i = 0; i < numSamples; i++) {
-            if (i % samplesPerSymbol === 0) {
-                lfsr = this.scrambleBit(lfsr);
-                // 8-PSK style phase shifts
-                currentPhase = ((lfsr & 0x7) / 8) * 2 * Math.PI;
-            }
-            phase += 2 * Math.PI * carrierFreq / this.sampleRate;
-            samples[i] = 0.4 * Math.sin(phase + currentPhase);
-        }
-
-        return samples;
-    }
-
-    /**
-     * Generate the V.34 modem negotiation sequence
-     * Based on ITU-T V.34 specification phases
-     */
-    generateModemNegotiation() {
-        const allSamples = [];
-
-        // Phase 1: ANSam - Answer tone with AM and phase reversals (2100 Hz)
-        // The characteristic "warbly" answering sound
-        allSamples.push(this.generateAnswerTone(2.0));
-
-        // Phase 2: V.21 low channel - short FSK bursts for capability exchange
-        allSamples.push(this.generateV21Handshake(0.2));
-        allSamples.push(this.generateSilence(0.05));
-
-        // Phase 2 continued: INFO sequences at 600 bps DPSK
-        // Sounds like low-pitched warble
-        allSamples.push(this.generateScrambledTraining(0.3, 600, 600));
-
-        // Phase 2: L1/L2 Line probing - 21 tones test the line
-        // Creates a harsh broadband sound
-        allSamples.push(this.generateLineProbing(0.8));
-
-        // Phase 2: A signal - 2400 Hz with phase reversals
-        allSamples.push(this.generateToneWithPhaseReversals(2400, 0.3));
-
-        // Phase 2: B signal - 1200 Hz with phase reversals
-        allSamples.push(this.generateToneWithPhaseReversals(1200, 0.2));
-
-        // Phase 3: Equalizer training (TRN) - scrambled ones at 1800 Hz carrier
-        // This is the main "screech" - sounds like harsh static
-        allSamples.push(this.generateScrambledTraining(1.5, 1800, 3000));
-
-        // Phase 4: Final training - higher symbol rate
-        // Slightly different pitch as rate increases
-        allSamples.push(this.generateScrambledTraining(0.8, 1800, 3200));
-
-        // Final J pattern and sync - brief pure tones
-        allSamples.push(this.generateToneSamples(1800, 0.1));
-        allSamples.push(this.generateSilence(0.05));
-
-        return this.concatenateSamples(allSamples);
-    }
-
-    /**
-     * Generate complete dial-up connection sequence
-     * Returns samples and timing info for UI synchronization
-     */
-    generateDialupSequence(phoneNumber = '5551234') {
-        const allSamples = [];
-        const events = [];
-        let currentTime = 0;
-
-        // 1. Dial tone
-        events.push({ type: 'dialTone', time: currentTime });
-        const dialTone = this.generateDialTone();
-        allSamples.push(dialTone);
-        currentTime += this.DIAL_TONE_DURATION;
-
-        // 2. DTMF dialing
-        events.push({ type: 'dialing', time: currentTime });
-        const dtmfDuration = phoneNumber.length * (this.DTMF_TONE_DURATION + this.DTMF_PAUSE_DURATION);
-        allSamples.push(this.generateDTMFSequence(phoneNumber));
-        currentTime += dtmfDuration;
-
-        // Brief silence after dialing
-        allSamples.push(this.generateSilence(0.5));
-        currentTime += 0.5;
-
-        // 3. Ringback
-        events.push({ type: 'ringing', time: currentTime });
-        const ringback = this.generateRingback();
-        allSamples.push(ringback);
-        currentTime += this.RINGBACK_ON_DURATION;
-
-        // Silence after pickup
-        allSamples.push(this.generateSilence(0.3));
-        currentTime += 0.3;
-
-        // 4. Modem negotiation
-        events.push({ type: 'negotiating', time: currentTime });
-        const negotiation = this.generateModemNegotiation();
-        allSamples.push(negotiation);
-        currentTime += negotiation.length / this.sampleRate;
-
-        // 5. Connected
-        events.push({ type: 'connected', time: currentTime });
-
-        return {
-            samples: this.concatenateSamples(allSamples),
-            events: events,
-            totalDuration: currentTime
-        };
-    }
-
-    /**
-     * Encode a single byte using 8-N-1 format
-     * Returns array of 10 bits: [start, d0, d1, d2, d3, d4, d5, d6, d7, stop]
-     */
-    encodeByte(byte) {
-        const bits = [];
-
-        // Start bit (always 0/space)
-        bits.push(0);
-
-        // 8 data bits, LSB first
-        for (let i = 0; i < 8; i++) {
-            bits.push((byte >> i) & 1);
-        }
-
-        // Stop bit (always 1/mark)
-        bits.push(1);
-
-        return bits;
-    }
-
-    /**
-     * Concatenate multiple Float32Arrays
-     */
-    concatenateSamples(arrays) {
-        const totalLength = arrays.reduce((sum, arr) => sum + arr.length, 0);
-        const result = new Float32Array(totalLength);
-        let offset = 0;
-
-        for (const arr of arrays) {
-            result.set(arr, offset);
-            offset += arr.length;
-        }
-
-        return result;
-    }
-
-    /**
-     * Generate complete transmission audio for text
-     * Includes handshake + data
+     * Generate the complete FSK transmission for text: channel seizure, mark
+     * preamble, 8-N-1 data bytes, and a trailing mark.
      */
     generateTransmission(text) {
-        // Reset phase for new transmission
         this.phase = 0;
-
         const segments = [];
 
-        // 1. Channel seizure: 300 bits of alternating space/mark (01010101...)
+        // 1. Channel seizure: alternating space/mark (01010101...)
         for (let i = 0; i < this.CHANNEL_SEIZURE_BITS; i++) {
             segments.push({
                 freq: (i % 2) ? this.MARK_FREQ : this.SPACE_FREQ,
@@ -527,7 +441,7 @@ class Bell202Modem {
             });
         }
 
-        // 2. Mark preamble (130ms of continuous 1200 Hz)
+        // 2. Mark preamble (continuous 1200 Hz)
         segments.push({ freq: this.MARK_FREQ, duration: this.MARK_PREAMBLE_DURATION });
 
         // 3. Data bytes (8-N-1, LSB first)
@@ -540,47 +454,56 @@ class Bell202Modem {
             }
         }
 
-        // 4. Trailing mark (brief carrier sustain)
-        segments.push({ freq: this.MARK_FREQ, duration: 0.050 });
+        // 4. Trailing mark
+        segments.push({ freq: this.MARK_FREQ, duration: this.TRAILING_MARK_DURATION });
 
         return this.renderTones(segments);
     }
 
-    /**
-     * Calculate timing for character display synchronization
-     * Returns array of {char, startTime} objects
-     */
-    calculateCharacterTimings(text) {
-        const timings = [];
-
-        // Handshake duration
-        const channelSeizureDuration = this.CHANNEL_SEIZURE_BITS * this.BIT_DURATION;
-        const handshakeDuration = channelSeizureDuration + this.MARK_PREAMBLE_DURATION;
-
-        // Each character is 10 bits (start + 8 data + stop)
-        const charDuration = 10 * this.BIT_DURATION;
-
-        let currentTime = handshakeDuration;
-
-        for (const char of text) {
-            timings.push({
-                char: char,
-                startTime: currentTime
-            });
-            currentTime += charDuration;
+    /** Concatenate multiple Float32Arrays into one. */
+    concatenateSamples(arrays) {
+        const total = arrays.reduce((sum, arr) => sum + arr.length, 0);
+        const result = new Float32Array(total);
+        let offset = 0;
+        for (const arr of arrays) {
+            result.set(arr, offset);
+            offset += arr.length;
         }
-
-        return {
-            timings: timings,
-            handshakeDuration: handshakeDuration,
-            totalDuration: currentTime + 0.050  // Include trailing mark
-        };
+        return result;
     }
 
     /**
-     * Transmit text with audio
-     * Returns a promise that resolves when transmission is complete
-     * If not connected, plays full dial-up handshake first
+     * Character display timings for the data region.
+     * Returns { timings: [{char, startTime}], handshakeDuration, totalDuration }.
+     */
+    calculateCharacterTimings(text) {
+        const handshakeDuration =
+            this.CHANNEL_SEIZURE_BITS * this.BIT_DURATION + this.MARK_PREAMBLE_DURATION;
+        const charDuration = 10 * this.BIT_DURATION;  // start + 8 data + stop
+
+        const timings = [];
+        let time = handshakeDuration;
+        for (const char of text) {
+            timings.push({ char, startTime: time });
+            time += charDuration;
+        }
+
+        return {
+            timings,
+            handshakeDuration,
+            totalDuration: time + this.TRAILING_MARK_DURATION
+        };
+    }
+
+    // ---- Playback -----------------------------------------------------------
+
+    /**
+     * Transmit text with audio. Resolves when playback actually finishes.
+     * If not yet connected, plays the full dial-up handshake first.
+     *
+     * UI callbacks (onCharacter, onCarrierDetect, onConnectionStatus) are driven
+     * off the audio clock (audioContext.currentTime), so the display stays
+     * locked to the sound even on long messages.
      */
     async transmit(text, onCharacter, phoneNumber = '5551234') {
         if (this.isTransmitting) {
@@ -589,110 +512,124 @@ class Bell202Modem {
 
         await this.init();
         this.isTransmitting = true;
+        if (this.onTransmitStart) this.onTransmitStart();
 
-        if (this.onTransmitStart) {
-            this.onTransmitStart();
-        }
-
-        const allSamples = [];
+        // Build audio (optional dial-up + data) and the event schedule.
+        const parts = [];
+        const events = [];
         let dialupDuration = 0;
 
-        // If not connected, generate dial-up sequence first
         if (!this.isConnected) {
             const dialup = this.generateDialupSequence(phoneNumber);
-            allSamples.push(dialup.samples);
+            parts.push(dialup.samples);
             dialupDuration = dialup.totalDuration;
-
-            // Schedule connection status callbacks
-            if (this.onConnectionStatus) {
-                for (const event of dialup.events) {
-                    setTimeout(() => {
-                        this.onConnectionStatus(event.type);
-                    }, event.time * 1000);
-                }
+            for (const ev of dialup.events) {
+                events.push({ time: ev.time, fn: () => this.onConnectionStatus && this.onConnectionStatus(ev.type) });
             }
         }
 
-        // Generate data transmission audio
-        const dataSamples = this.generateTransmission(text);
-        allSamples.push(dataSamples);
+        parts.push(this.generateTransmission(text));
+        const combined = this.concatenateSamples(parts);
 
-        // Calculate character timings (offset by dialup duration)
-        const timings = this.calculateCharacterTimings(text);
+        const timing = this.calculateCharacterTimings(text);
+        const seizureDuration = this.CHANNEL_SEIZURE_BITS * this.BIT_DURATION;
+        if (this.onCarrierDetect) {
+            events.push({ time: dialupDuration + seizureDuration, fn: () => this.onCarrierDetect(true) });
+        }
+        if (onCharacter) {
+            for (const t of timing.timings) {
+                events.push({ time: dialupDuration + t.startTime, fn: () => onCharacter(t.char) });
+            }
+        }
+        events.sort((a, b) => a.time - b.time);
 
-        // Combine all audio
-        const combinedSamples = this.concatenateSamples(allSamples);
-
-        // Create audio buffer
-        const buffer = this.audioContext.createBuffer(1, combinedSamples.length, this.sampleRate);
-        buffer.getChannelData(0).set(combinedSamples);
-
-        // Create and start source
+        // Create and start the single buffer source.
+        const buffer = this.audioContext.createBuffer(1, combined.length, this.sampleRate);
+        buffer.getChannelData(0).set(combined);
         const source = this.audioContext.createBufferSource();
         source.buffer = buffer;
         source.connect(this.audioContext.destination);
 
+        this._activeSource = source;
+        this._events = events;
+        this._eventIndex = 0;
         const startTime = this.audioContext.currentTime;
-        source.start(startTime);
 
-        // Signal carrier detect after channel seizure (offset by dialup duration)
-        if (this.onCarrierDetect) {
-            const channelSeizureDuration = this.CHANNEL_SEIZURE_BITS * this.BIT_DURATION;
-            setTimeout(() => {
-                this.onCarrierDetect(true);
-            }, (dialupDuration + channelSeizureDuration) * 1000);
-        }
-
-        // Schedule character callbacks (offset by dialup duration)
-        if (onCharacter) {
-            for (const timing of timings.timings) {
-                setTimeout(() => {
-                    onCharacter(timing.char);
-                }, (dialupDuration + timing.startTime) * 1000);
-            }
-        }
-
-        // Calculate total duration
-        const totalDuration = dialupDuration + timings.totalDuration;
-
-        // Return promise that resolves when done
         return new Promise((resolve) => {
-            setTimeout(() => {
-                this.isTransmitting = false;
-                this.isConnected = true;  // Mark as connected after first transmission
-                if (this.onCarrierDetect) {
-                    this.onCarrierDetect(false);
+            this._activeResolve = resolve;
+
+            const tick = () => {
+                if (!this.isTransmitting) return;  // aborted via stop()
+                const elapsed = this.audioContext.currentTime - startTime;
+                while (this._eventIndex < events.length && events[this._eventIndex].time <= elapsed) {
+                    events[this._eventIndex++].fn();
                 }
-                if (this.onTransmitEnd) {
-                    this.onTransmitEnd();
+                if (this._eventIndex < events.length) {
+                    this._frameId = requestFrame(tick);
                 }
-                resolve();
-            }, totalDuration * 1000);
+            };
+
+            source.onended = () => this._finishTransmission();
+            source.start(startTime);
+            this._frameId = requestFrame(tick);
         });
     }
 
-    /**
-     * Disconnect the modem (resets connection state)
-     * Next transmission will play dial-up sequence again
-     */
-    disconnect() {
-        this.isConnected = false;
-        if (this.onConnectionStatus) {
-            this.onConnectionStatus('disconnected');
+    /** Natural completion: flush any remaining events, then resolve. */
+    _finishTransmission() {
+        if (this._events) {
+            while (this._eventIndex < this._events.length) {
+                this._events[this._eventIndex++].fn();
+            }
         }
+        this.isConnected = true;  // handshake done after first transmission
+        this._teardown();
+    }
+
+    /** Shared cleanup for both natural completion and stop(). */
+    _teardown() {
+        if (this._frameId !== null) {
+            cancelFrame(this._frameId);
+            this._frameId = null;
+        }
+        if (this._activeSource) {
+            this._activeSource.onended = null;
+            try { this._activeSource.stop(); } catch (e) { /* already stopped */ }
+            try { this._activeSource.disconnect(); } catch (e) { /* noop */ }
+            this._activeSource = null;
+        }
+        this._events = null;
+        this._eventIndex = 0;
+        this.isTransmitting = false;
+
+        if (this.onCarrierDetect) this.onCarrierDetect(false);
+        if (this.onTransmitEnd) this.onTransmitEnd();
+
+        const resolve = this._activeResolve;
+        this._activeResolve = null;
+        if (resolve) resolve();
     }
 
     /**
-     * Stop any current transmission
+     * Stop the current transmission immediately (does NOT close the AudioContext,
+     * so the next transmission starts instantly). Safe to call when idle.
      */
     stop() {
-        this.isTransmitting = false;
-        if (this.audioContext) {
-            this.audioContext.close();
-            this.audioContext = null;
-        }
+        if (!this.isTransmitting) return;
+        this._teardown();
+    }
+
+    /**
+     * Disconnect the modem (resets connection state). Aborts any in-flight
+     * transmission so the next one replays the dial-up sequence.
+     */
+    disconnect() {
+        this.stop();
+        this.isConnected = false;
+        if (this.onConnectionStatus) this.onConnectionStatus('disconnected');
     }
 }
 
-// Export for use in app.js
-window.Bell202Modem = Bell202Modem;
+// Export for browser (script tag) and Node (tests).
+if (typeof window !== 'undefined') window.Bell202Modem = Bell202Modem;
+if (typeof module !== 'undefined' && module.exports) module.exports = Bell202Modem;
