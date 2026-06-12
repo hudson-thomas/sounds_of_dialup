@@ -11,6 +11,11 @@ https://github.com/user-attachments/assets/afdc5943-5e51-462b-a287-0ff629da57c3
 ## Features
 
 - Bell 202 modem audio emulation at 1200 baud (8-N-1)
+- **Real modem loopback** — the receiver genuinely demodulates the FSK off the
+  audio (Goertzel detector + UART clock recovery), it is not handed the text
+- **Noisy line + error correction** — a LINE NOISE knob injects impulsive line
+  static; Hamming(8,4) FEC repairs bit-flips and a CRC-16 flags what it can't.
+  Toggle correction off to watch the same line shred the message
 - Full dial-up handshake: dial tone, DTMF dialing, ringback, and V.34 negotiation screech
 - Retro CRT monitor-style interface with scanlines
 - Real-time transmission mode
@@ -54,8 +59,9 @@ Type a message in the sender terminal and click SEND (or enable real-time mode) 
 ## Tests
 
 The browser DSP engine has a dependency-free test suite (requires Node 18+) covering
-8-N-1 framing, a Goertzel-based demodulation round-trip, clipping limits, and the
-dial-up sequence:
+8-N-1 framing, the Goertzel demodulator, Hamming/CRC error correction, and the full
+noisy-channel loopback (including the guarantee that a passing CRC never certifies
+corrupted data):
 
 ```bash
 node --test

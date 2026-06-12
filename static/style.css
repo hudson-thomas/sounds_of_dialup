@@ -239,6 +239,67 @@ button:active {
     cursor: pointer;
 }
 
+/* Line panel (noise + FEC + decode report) */
+.line-panel {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 15px;
+    margin-top: 10px;
+    padding: 10px 15px;
+    background: linear-gradient(145deg, #c8c8bc, #9c9c90);
+    border-radius: 8px;
+}
+
+.line-control {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 11px;
+    color: #333;
+    font-weight: bold;
+}
+
+.line-control input[type="range"] {
+    width: 120px;
+    accent-color: #b06000;
+    cursor: pointer;
+}
+
+#noise-readout {
+    min-width: 34px;
+    text-align: right;
+}
+
+.decode-stats {
+    flex-basis: 100%;
+    font-family: 'Courier New', monospace;
+    font-size: 11px;
+    color: #555;
+    min-height: 14px;
+}
+
+.decode-stats.crc-ok {
+    color: #1a7a1a;
+}
+
+.decode-stats.crc-fail {
+    color: #c02020;
+    font-weight: bold;
+}
+
+/* Received characters repaired or damaged by the line */
+.ch-corrected {
+    color: #d98500;
+    text-shadow: 0 0 4px rgba(217, 133, 0, 0.6);
+}
+
+.ch-error {
+    color: #ff3b3b;
+    background: rgba(255, 59, 59, 0.18);
+    text-shadow: 0 0 4px rgba(255, 59, 59, 0.6);
+}
+
 /* Monitor labels */
 .label {
     margin-top: 10px;

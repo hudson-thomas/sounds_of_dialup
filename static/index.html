@@ -57,6 +57,20 @@
                     <button id="clear-btn">CLEAR</button>
                     <button id="hangup-btn">HANG UP</button>
                 </div>
+                <div class="line-panel">
+                    <div class="line-control">
+                        <label for="noise-level">LINE NOISE</label>
+                        <input type="range" id="noise-level" min="0" max="100" value="0">
+                        <span id="noise-readout">0%</span>
+                    </div>
+                    <div class="mode-toggle">
+                        <label>
+                            <input type="checkbox" id="fec-mode" checked>
+                            <span>Error correction</span>
+                        </label>
+                    </div>
+                    <div id="decode-stats" class="decode-stats">&nbsp;</div>
+                </div>
             </div>
             <div class="label">RECEIVER</div>
         </div>
@@ -66,8 +80,11 @@
         <span id="link-status">OFFLINE</span>
         <span id="connection-status">ON HOOK</span>
         <span id="protocol-info">Bell 202 | 1200 baud | 8-N-1</span>
+        <span id="debug-status"></span>
     </div>
 
+    <script src="/static/fec.js"></script>
+    <script src="/static/demod.js"></script>
     <script src="/static/bell202.js"></script>
     <script src="/static/app.js"></script>
 </body>

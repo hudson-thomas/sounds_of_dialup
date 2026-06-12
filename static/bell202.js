@@ -36,6 +36,20 @@ const cancelFrame = (typeof cancelAnimationFrame !== 'undefined')
     ? cancelAnimationFrame.bind(globalThis)
     : clearTimeout;
 
+// The FEC codec and FSK demodulator live in sibling modules. In the browser
+// they are plain globals (load fec.js + demod.js before this file); under Node
+// (tests) they are required. Note the underscore-prefixed names: classic
+// <script> tags share one global lexical scope, so reusing `FEC` /
+// `Bell202Demodulator` here would collide with those modules' own declarations.
+let _FEC, _Demodulator;
+if (typeof require !== 'undefined') {
+    _FEC = require('./fec.js');
+    _Demodulator = require('./demod.js');
+} else {
+    _FEC = globalThis.FEC;
+    _Demodulator = globalThis.Bell202Demodulator;
+}
+
 class Bell202Modem {
     constructor() {
         this.audioContext = null;
@@ -89,6 +103,15 @@ class Bell202Modem {
         // Anti-click fade applied to each dial-up segment boundary
         this.SEGMENT_FADE_DURATION = 0.005;     // 5ms raised-cosine ramp
 
+        // Line-noise model. Dial-up lines are dominated by *impulsive* noise
+        // (crackles/pops), not smooth hiss — and impulse bursts produce the
+        // sparse, localised bit errors that FEC is actually good at. So the
+        // channel is: gentle always-harmless background hiss + occasional
+        // ~1-bit-long noise bursts whose rate scales with the noise level.
+        this.NOISE_HISS_SIGMA = 0.12;     // background hiss at level 1.0 (cosmetic)
+        this.NOISE_BURST_RATE = 0.0016;   // burst-start probability/sample at level 1.0
+        this.NOISE_BURST_SIGMA = 2.6;     // burst strength (enough to flip its bit)
+
         // State
         this.isTransmitting = false;
         this.isConnected = false;       // Has the dial-up handshake completed?
@@ -99,27 +122,48 @@ class Bell202Modem {
         this._activeSource = null;
         this._activeResolve = null;
         this._frameId = null;
+        this._backstopId = null;
         this._events = null;
         this._eventIndex = 0;
+
+        // Receiver: a real FSK demodulator decodes the (noisy) audio.
+        this.demodulator = new _Demodulator({
+            sampleRate: this.sampleRate,
+            markFreq: this.MARK_FREQ,
+            spaceFreq: this.SPACE_FREQ,
+            baud: this.BAUD_RATE
+        });
+        this._decodeStats = null;
 
         // Callbacks
         this.onTransmitStart = null;
         this.onTransmitEnd = null;
         this.onCarrierDetect = null;
         this.onConnectionStatus = null; // Called with status updates during dial-up
+        this.onDecodeStats = null;      // Called with the decode report when done
     }
 
     /**
-     * Initialize audio context (must be called from a user gesture)
+     * Initialize the audio context. Best called from a user gesture (browser
+     * autoplay policy), but safe to call repeatedly and from anywhere.
+     *
+     * We do NOT force the context sample rate: some browsers/devices throw
+     * NotSupportedError if asked for a rate the hardware can't run at. Our
+     * buffers declare 44.1 kHz and the context resamples on playback, while the
+     * demodulator works on the raw 44.1 kHz samples directly — so the context's
+     * own rate is irrelevant to correctness.
      */
     async init() {
         if (!this.audioContext) {
-            this.audioContext = new (window.AudioContext || window.webkitAudioContext)({
-                sampleRate: this.sampleRate
-            });
+            const Ctx = window.AudioContext || window.webkitAudioContext;
+            this.audioContext = new Ctx();
         }
         if (this.audioContext.state === 'suspended') {
-            await this.audioContext.resume();
+            try {
+                await this.audioContext.resume();
+            } catch (e) {
+                /* resume() needs a user gesture; the wall-clock backstop covers us */
+            }
         }
         return this;
     }
@@ -426,10 +470,10 @@ class Bell202Modem {
     }
 
     /**
-     * Generate the complete FSK transmission for text: channel seizure, mark
-     * preamble, 8-N-1 data bytes, and a trailing mark.
+     * Generate the complete FSK transmission for a sequence of bytes: channel
+     * seizure, mark preamble, 8-N-1 data bytes, and a trailing mark.
      */
-    generateTransmission(text) {
+    generateTransmissionFromBytes(bytes) {
         this.phase = 0;
         const segments = [];
 
@@ -445,8 +489,8 @@ class Bell202Modem {
         segments.push({ freq: this.MARK_FREQ, duration: this.MARK_PREAMBLE_DURATION });
 
         // 3. Data bytes (8-N-1, LSB first)
-        for (const char of text) {
-            for (const bit of this.encodeByte(char.charCodeAt(0))) {
+        for (const byte of bytes) {
+            for (const bit of this.encodeByte(byte)) {
                 segments.push({
                     freq: bit ? this.MARK_FREQ : this.SPACE_FREQ,
                     duration: this.BIT_DURATION
@@ -458,6 +502,58 @@ class Bell202Modem {
         segments.push({ freq: this.MARK_FREQ, duration: this.TRAILING_MARK_DURATION });
 
         return this.renderTones(segments);
+    }
+
+    /** Generate the FSK transmission for text (each char -> one byte). */
+    generateTransmission(text) {
+        return this.generateTransmissionFromBytes(
+            Array.from(text, (c) => c.charCodeAt(0)));
+    }
+
+    /**
+     * Sample offset of the first start bit within a transmission buffer
+     * (i.e. the end of channel seizure + mark preamble). Matches the per-segment
+     * rounding used by renderTones, so a demodulator can be pointed straight at
+     * the data region.
+     */
+    dataStartSamples() {
+        return this.CHANNEL_SEIZURE_BITS * this.samples(this.BIT_DURATION)
+            + this.samples(this.MARK_PREAMBLE_DURATION);
+    }
+
+    /**
+     * Mix "static on the line" into a buffer in place: gentle background hiss
+     * plus impulsive noise bursts (crackles) whose rate scales with `level`
+     * (0..1). Each burst is about one bit long, so it tends to corrupt a single
+     * bit — the sparse error pattern FEC can repair. Soft-limited so it never
+     * clips. Pass a seeded `rng` for reproducible results.
+     */
+    addNoise(buffer, level, rng = Math.random) {
+        if (!level) return buffer;
+
+        // Box-Muller standard normal.
+        const gauss = () => {
+            const u1 = Math.max(rng(), 1e-12);
+            return Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * rng());
+        };
+
+        const hissSigma = level * this.NOISE_HISS_SIGMA;
+        const burstProb = level * this.NOISE_BURST_RATE;
+        const burstLen = this.samples(this.BIT_DURATION);
+        let burstRemaining = 0;
+
+        for (let i = 0; i < buffer.length; i++) {
+            let n = hissSigma * gauss();
+            if (burstRemaining === 0 && rng() < burstProb) {
+                burstRemaining = burstLen;
+            }
+            if (burstRemaining > 0) {
+                n += this.NOISE_BURST_SIGMA * gauss();
+                burstRemaining--;
+            }
+            buffer[i] += n;
+        }
+        return this.softLimit(buffer);
     }
 
     /** Concatenate multiple Float32Arrays into one. */
@@ -498,27 +594,36 @@ class Bell202Modem {
     // ---- Playback -----------------------------------------------------------
 
     /**
-     * Transmit text with audio. Resolves when playback actually finishes.
-     * If not yet connected, plays the full dial-up handshake first.
+     * Transmit text as a real modem loopback over a (optionally noisy) line:
      *
-     * UI callbacks (onCharacter, onCarrierDetect, onConnectionStatus) are driven
-     * off the audio clock (audioContext.currentTime), so the display stays
-     * locked to the sound even on long messages.
+     *   text -> CRC frame -> FEC -> FSK modulate -> + line noise -> play
+     *        -> demodulate the SAME waveform -> FEC correct -> CRC check -> show
+     *
+     * The receiver decodes the actual audio, so under heavy noise the recovered
+     * text really can differ from what was sent. `onCharacter(char, status)`
+     * fires per recovered character (status: 'ok' | 'corrected' | 'error'),
+     * driven off the audio clock. Resolves with — and reports via onDecodeStats
+     * — a decode report.
+     *
+     * options: { phoneNumber, noiseLevel (0..1), fec (bool), rng }
      */
-    async transmit(text, onCharacter, phoneNumber = '5551234') {
+    async transmit(text, onCharacter, options = {}) {
         if (this.isTransmitting) {
             throw new Error('Already transmitting');
         }
+        const { phoneNumber = '5551234', noiseLevel = 0, fec = true, rng } = options;
 
         await this.init();
         this.isTransmitting = true;
         if (this.onTransmitStart) this.onTransmitStart();
 
-        // Build audio (optional dial-up + data) and the event schedule.
+        // ---- Transmitter: frame + FEC + modulate ----
+        const payload = Array.from(text, (c) => c.charCodeAt(0));
+        const wire = _FEC.encodeFrame(payload, { fec });
+
         const parts = [];
         const events = [];
         let dialupDuration = 0;
-
         if (!this.isConnected) {
             const dialup = this.generateDialupSequence(phoneNumber);
             parts.push(dialup.samples);
@@ -527,23 +632,44 @@ class Bell202Modem {
                 events.push({ time: ev.time, fn: () => this.onConnectionStatus && this.onConnectionStatus(ev.type) });
             }
         }
-
-        parts.push(this.generateTransmission(text));
+        const dialupSampleCount = parts.reduce((sum, a) => sum + a.length, 0);
+        parts.push(this.generateTransmissionFromBytes(wire));
         const combined = this.concatenateSamples(parts);
 
-        const timing = this.calculateCharacterTimings(text);
+        // ---- Channel: mix in line noise (mutates the buffer we both play AND decode) ----
+        if (noiseLevel) this.addNoise(combined, noiseLevel, rng || Math.random);
+
+        // ---- Receiver: demodulate the exact waveform, then FEC/CRC decode ----
+        const dataStartAbs = dialupSampleCount + this.dataStartSamples();
+        const { frames } = this.demodulator.demodulate(combined, dataStartAbs, wire.length);
+        const rxBytes = frames.map((f) => f.value);
+        const decoded = _FEC.decodeFrame(rxBytes, { fec });
+        const stats = this._buildDecodeStats(text, wire, rxBytes, decoded, fec, noiseLevel);
+        this._decodeStats = stats;
+
+        // ---- Schedule UI events on the audio clock ----
         const seizureDuration = this.CHANNEL_SEIZURE_BITS * this.BIT_DURATION;
         if (this.onCarrierDetect) {
             events.push({ time: dialupDuration + seizureDuration, fn: () => this.onCarrierDetect(true) });
         }
         if (onCharacter) {
-            for (const t of timing.timings) {
-                events.push({ time: dialupDuration + t.startTime, fn: () => onCharacter(t.char) });
+            const per = fec ? 2 : 1;
+            for (let j = 0; j < decoded.payload.length; j++) {
+                // Frame is [LEN_hi, LEN_lo, payload...], so payload byte j is
+                // frame byte (2 + j); take the last codeword of it for reveal time.
+                const wireIdx = (2 + j + 1) * per - 1;
+                const frame = frames[wireIdx];
+                const time = frame
+                    ? frame.center / this.sampleRate
+                    : dataStartAbs / this.sampleRate + (j + 1) * 10 * this.BIT_DURATION;
+                const ch = String.fromCharCode(decoded.payload[j]);
+                const status = decoded.byteStatuses[j] || 'ok';
+                events.push({ time, fn: () => onCharacter(ch, status) });
             }
         }
         events.sort((a, b) => a.time - b.time);
 
-        // Create and start the single buffer source.
+        // ---- Play the line audio ----
         const buffer = this.audioContext.createBuffer(1, combined.length, this.sampleRate);
         buffer.getChannelData(0).set(combined);
         const source = this.audioContext.createBufferSource();
@@ -554,6 +680,7 @@ class Bell202Modem {
         this._events = events;
         this._eventIndex = 0;
         const startTime = this.audioContext.currentTime;
+        const durationMs = (combined.length / this.sampleRate) * 1000;
 
         return new Promise((resolve) => {
             this._activeResolve = resolve;
@@ -569,28 +696,62 @@ class Bell202Modem {
                 }
             };
 
+            // Wall-clock backstop: if the audio clock never advances (e.g. a
+            // suspended AudioContext) source.onended would never fire and this
+            // promise would hang forever, wedging the caller's queue. Guarantee
+            // completion regardless.
+            this._backstopId = setTimeout(() => this._finishTransmission(), durationMs + 1000);
+
             source.onended = () => this._finishTransmission();
             source.start(startTime);
             this._frameId = requestFrame(tick);
         });
     }
 
-    /** Natural completion: flush any remaining events, then resolve. */
+    /** Assemble the decode report (also used by tests). */
+    _buildDecodeStats(sentText, wire, rxBytes, decoded, fec, noiseLevel) {
+        let bitErrors = 0;
+        const n = Math.min(wire.length, rxBytes.length);
+        for (let i = 0; i < n; i++) {
+            let x = (wire[i] ^ rxBytes[i]) & 0xFF;
+            while (x) { bitErrors += x & 1; x >>= 1; }
+        }
+        bitErrors += Math.abs(wire.length - rxBytes.length) * 8;  // dropped/extra bytes
+        return {
+            sent: sentText,
+            decoded: String.fromCharCode(...decoded.payload),
+            fec,
+            noiseLevel,
+            bitErrors,
+            corrected: decoded.corrected,
+            uncorrectable: decoded.uncorrectable,
+            crcOk: decoded.crcOk
+        };
+    }
+
+    /** Natural completion: flush remaining events, emit stats, resolve. */
     _finishTransmission() {
+        if (!this.isTransmitting) return;  // idempotent: onended + backstop may race
         if (this._events) {
             while (this._eventIndex < this._events.length) {
                 this._events[this._eventIndex++].fn();
             }
         }
         this.isConnected = true;  // handshake done after first transmission
-        this._teardown();
+        const stats = this._decodeStats;
+        if (stats && this.onDecodeStats) this.onDecodeStats(stats);
+        this._teardown(stats);
     }
 
     /** Shared cleanup for both natural completion and stop(). */
-    _teardown() {
+    _teardown(result = null) {
         if (this._frameId !== null) {
             cancelFrame(this._frameId);
             this._frameId = null;
+        }
+        if (this._backstopId !== null && this._backstopId !== undefined) {
+            clearTimeout(this._backstopId);
+            this._backstopId = null;
         }
         if (this._activeSource) {
             this._activeSource.onended = null;
@@ -600,6 +761,7 @@ class Bell202Modem {
         }
         this._events = null;
         this._eventIndex = 0;
+        this._decodeStats = null;
         this.isTransmitting = false;
 
         if (this.onCarrierDetect) this.onCarrierDetect(false);
@@ -607,7 +769,7 @@ class Bell202Modem {
 
         const resolve = this._activeResolve;
         this._activeResolve = null;
-        if (resolve) resolve();
+        if (resolve) resolve(result);
     }
 
     /**

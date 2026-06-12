@@ -14,11 +14,16 @@ class DialupEmulator {
         this.clearBtn = document.getElementById('clear-btn');
         this.hangupBtn = document.getElementById('hangup-btn');
         this.realtimeMode = document.getElementById('realtime-mode');
+        this.noiseLevel = document.getElementById('noise-level');
+        this.noiseReadout = document.getElementById('noise-readout');
+        this.fecMode = document.getElementById('fec-mode');
+        this.decodeStats = document.getElementById('decode-stats');
         this.txLed = document.getElementById('tx-led');
         this.rxLed = document.getElementById('rx-led');
         this.cdLed = document.getElementById('cd-led');
         this.linkStatus = document.getElementById('link-status');        // WebSocket transport
         this.connectionStatus = document.getElementById('connection-status');  // modem line state
+        this.debugStatus = document.getElementById('debug-status');      // diagnostics
 
         // Modem
         this.modem = new Bell202Modem();
@@ -37,10 +42,30 @@ class DialupEmulator {
     }
 
     init() {
+        this.setupDiagnostics();
         this.setupModemCallbacks();
         this.setupEventListeners();
         this.connectWebSocket();
         this.updateCursor();
+    }
+
+    // Surface what's happening (and any error) on-page, so failures are visible
+    // without opening DevTools.
+    debug(msg, isError = false) {
+        if (this.debugStatus) {
+            this.debugStatus.textContent = msg;
+            this.debugStatus.style.color = isError ? '#ff5555' : '#777';
+        }
+        (isError ? console.error : console.log)('[dialup]', msg);
+    }
+
+    setupDiagnostics() {
+        window.addEventListener('error', (e) => {
+            this.debug(`JS error: ${e.message}`, true);
+        });
+        window.addEventListener('unhandledrejection', (e) => {
+            this.debug(`promise rejection: ${e.reason && e.reason.message || e.reason}`, true);
+        });
     }
 
     setupModemCallbacks() {
@@ -65,6 +90,19 @@ class DialupEmulator {
         this.modem.onConnectionStatus = (status) => {
             this.updateConnectionDisplay(status);
         };
+
+        this.modem.onDecodeStats = (stats) => {
+            this.showDecodeStats(stats);
+        };
+    }
+
+    showDecodeStats(stats) {
+        const parts = [`${stats.bitErrors} bit err`];
+        if (stats.fec) parts.push(`${stats.corrected} corrected`);
+        if (stats.uncorrectable) parts.push(`${stats.uncorrectable} uncorrectable`);
+        parts.push(stats.crcOk ? 'CRC OK' : 'CRC FAIL');
+        this.decodeStats.textContent = parts.join(' · ');
+        this.decodeStats.className = 'decode-stats ' + (stats.crcOk ? 'crc-ok' : 'crc-fail');
     }
 
     updateConnectionDisplay(status) {
@@ -127,10 +165,19 @@ class DialupEmulator {
             }
         });
 
-        // Initialize audio context on first interaction
-        document.addEventListener('click', async () => {
-            await this.modem.init();
-        }, { once: true });
+        // Line-noise slider readout
+        this.noiseLevel.addEventListener('input', () => {
+            this.noiseReadout.textContent = `${this.noiseLevel.value}%`;
+        });
+
+        // Unlock/resume the AudioContext on user gestures. Browser autoplay
+        // policy keeps a context 'suspended' until a gesture resumes it, and a
+        // context can be re-suspended later — so we (idempotently) resume on
+        // every gesture, not just the first, otherwise transmissions that start
+        // from a network callback would play to a stopped clock.
+        const resumeAudio = () => this.modem.init();
+        document.addEventListener('pointerdown', resumeAudio);
+        document.addEventListener('keydown', resumeAudio);
     }
 
     connectWebSocket() {
@@ -143,6 +190,7 @@ class DialupEmulator {
             this.isConnected = true;
             this.linkStatus.textContent = 'ONLINE';
             this.linkStatus.classList.add('online');
+            this.debug('link up');
         };
 
         this.ws.onclose = () => {
@@ -157,6 +205,7 @@ class DialupEmulator {
         this.ws.onmessage = (event) => {
             const message = JSON.parse(event.data);
             if (message.type === 'receive') {
+                this.debug('echo received — queueing');
                 this.queueTransmission(message.data);
             }
         };
@@ -168,7 +217,13 @@ class DialupEmulator {
 
     sendMessage() {
         const text = this.input.value;
-        if (!text || !this.isConnected) return;
+        if (!text) { this.debug('nothing to send'); return; }
+        if (!this.isConnected) { this.debug('link OFFLINE — cannot send', true); return; }
+        this.debug(`sending ${text.length} char(s)…`);
+
+        // Resume audio inside this click gesture so the (network-callback-driven)
+        // transmission later plays to a running clock.
+        this.modem.init();
 
         // Send via WebSocket
         this.ws.send(JSON.stringify({
@@ -211,35 +266,56 @@ class DialupEmulator {
         }
 
         this.isProcessingQueue = true;
-
-        while (this.transmitQueue.length > 0) {
-            const text = this.transmitQueue.shift();
-            await this.receiveTransmission(text);
+        try {
+            while (this.transmitQueue.length > 0) {
+                const text = this.transmitQueue.shift();
+                await this.receiveTransmission(text);
+            }
+        } finally {
+            // Never leave the queue wedged, even if a transmission throws.
+            this.isProcessingQueue = false;
         }
-
-        this.isProcessingQueue = false;
     }
 
     async receiveTransmission(text) {
         // Hide cursor during transmission
         this.setCursorVisible(false);
 
-        // Transmit with audio, displaying each character as it's "received"
-        await this.modem.transmit(text, (char) => {
-            this.appendCharacter(char);
-        });
-
-        // Show cursor again
-        this.setCursorVisible(true);
+        // Send over the (optionally noisy) line; characters appear as the
+        // receiver demodulates them, flagged by decode status.
+        const options = {
+            noiseLevel: parseInt(this.noiseLevel.value, 10) / 100,
+            fec: this.fecMode.checked
+        };
+        try {
+            const audioState = this.modem.audioContext ? this.modem.audioContext.state : 'no-context';
+            this.debug(`receiving (audio:${audioState}, noise ${Math.round(options.noiseLevel * 100)}%, FEC ${options.fec ? 'on' : 'off'})…`);
+            const stats = await this.modem.transmit(text, (char, status) => {
+                this.appendCharacter(char, status);
+            }, options);
+            if (stats) this.debug(`done: ${stats.crcOk ? 'CRC OK' : 'CRC FAIL'}`);
+        } catch (err) {
+            this.debug(`transmit error: ${err && err.message || err}`, true);
+        } finally {
+            // Always restore the cursor so the UI never gets stuck mid-receive.
+            this.setCursorVisible(true);
+        }
     }
 
-    appendCharacter(char) {
-        // Get the cursor element
+    appendCharacter(char, status = 'ok') {
         const cursor = this.output.querySelector('.cursor');
 
-        // Create text node and insert before cursor
-        const textNode = document.createTextNode(char);
-        this.output.insertBefore(textNode, cursor);
+        // Plain text for clean characters; a styled span for corrected/errored
+        // ones so line damage is visible.
+        let node;
+        if (status === 'ok') {
+            node = document.createTextNode(char);
+        } else {
+            node = document.createElement('span');
+            node.textContent = char;
+            node.className = `ch-${status}`;
+        }
+        this.output.insertBefore(node, cursor);
 
         // Auto-scroll to bottom
         this.output.scrollTop = this.output.scrollHeight;
@@ -250,6 +326,10 @@ class DialupEmulator {
         const cursor = this.output.querySelector('.cursor');
         this.output.innerHTML = '';
         this.output.appendChild(cursor);
+
+        // Reset the decode report
+        this.decodeStats.textContent = ' ';
+        this.decodeStats.className = 'decode-stats';
     }
 
     setCursorVisible(visible) {
