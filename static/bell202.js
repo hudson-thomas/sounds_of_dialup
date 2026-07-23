@@ -50,6 +50,50 @@ if (typeof require !== 'undefined') {
     _Demodulator = globalThis.Bell202Demodulator;
 }
 
+// ---- Text codec -------------------------------------------------------------
+//
+// Text goes on the wire as UTF-8 bytes. Using charCodeAt() directly would
+// silently truncate every character above U+00FF to its low byte — and because
+// the CRC is computed over the already-truncated frame, the integrity check
+// would then certify that corruption as healthy. Encoding properly means the
+// only damage the receiver can ever see is damage the *line* caused.
+
+/** Text -> UTF-8 bytes. */
+function encodeText(text) {
+    return Array.from(new TextEncoder().encode(text));
+}
+
+/** UTF-8 bytes -> text. Damaged sequences become U+FFFD instead of throwing. */
+function decodeText(bytes) {
+    return new TextDecoder('utf-8', { fatal: false }).decode(Uint8Array.from(bytes));
+}
+
+/**
+ * UTF-8 bytes -> characters, each tagged with the byte range it came from.
+ * The reveal animation needs this: a character can only be displayed once its
+ * LAST byte has arrived, and its health is the worst health of all its bytes.
+ * @returns {Array<{char: string, firstByte: number, lastByte: number}>}
+ */
+function decodeTextWithSpans(bytes) {
+    const buf = Uint8Array.from(bytes);
+    const decoder = new TextDecoder('utf-8', { fatal: false });
+    const out = [];
+    let next = 0;  // first byte not yet attributed to a character
+
+    const emit = (chunk, lastByte) => {
+        for (const char of chunk) {
+            out.push({ char, firstByte: Math.min(next, lastByte), lastByte });
+            next = lastByte + 1;
+        }
+    };
+
+    for (let i = 0; i < buf.length; i++) {
+        emit(decoder.decode(buf.subarray(i, i + 1), { stream: true }), i);
+    }
+    emit(decoder.decode(), Math.max(0, buf.length - 1));  // flush a dangling sequence
+    return out;
+}
+
 class Bell202Modem {
     constructor() {
         this.audioContext = null;
@@ -504,10 +548,9 @@ class Bell202Modem {
         return this.renderTones(segments);
     }
 
-    /** Generate the FSK transmission for text (each char -> one byte). */
+    /** Generate the FSK transmission for text (UTF-8 encoded). */
     generateTransmission(text) {
-        return this.generateTransmissionFromBytes(
-            Array.from(text, (c) => c.charCodeAt(0)));
+        return this.generateTransmissionFromBytes(encodeText(text));
     }
 
     /**
@@ -618,8 +661,7 @@ class Bell202Modem {
         if (this.onTransmitStart) this.onTransmitStart();
 
         // ---- Transmitter: frame + FEC + modulate ----
-        const payload = Array.from(text, (c) => c.charCodeAt(0));
-        const wire = _FEC.encodeFrame(payload, { fec });
+        const wire = _FEC.encodeFrame(encodeText(text), { fec });
 
         const parts = [];
         const events = [];
@@ -640,10 +682,17 @@ class Bell202Modem {
         if (noiseLevel) this.addNoise(combined, noiseLevel, rng || Math.random);
 
         // ---- Receiver: demodulate the exact waveform, then FEC/CRC decode ----
-        const dataStartAbs = dialupSampleCount + this.dataStartSamples();
-        const { frames } = this.demodulator.demodulate(combined, dataStartAbs, wire.length);
+        // The receiver syncs itself: all it gets is carrier onset (what a real
+        // modem's carrier-detect provides), and it finds the preamble, the first
+        // start bit, and the end of the message (via the frame's LEN field) on
+        // its own — no borrowing the transmitter's segment arithmetic.
+        const carrierOnset = dialupSampleCount;
+        const synced = this.demodulator.findDataStart(combined, carrierOnset);
+        const dataStartAbs = (synced >= 0) ? synced : carrierOnset + this.dataStartSamples();
+        const { frames } = this.demodulator.demodulate(combined, dataStartAbs);
         const rxBytes = frames.map((f) => f.value);
-        const decoded = _FEC.decodeFrame(rxBytes, { fec });
+        const framing = frames.map((f) => f.framingOk);
+        const decoded = _FEC.decodeFrame(rxBytes, { fec, framing });
         const stats = this._buildDecodeStats(text, wire, rxBytes, decoded, fec, noiseLevel);
         this._decodeStats = stats;
 
@@ -654,17 +703,21 @@ class Bell202Modem {
         }
         if (onCharacter) {
             const per = fec ? 2 : 1;
-            for (let j = 0; j < decoded.payload.length; j++) {
-                // Frame is [LEN_hi, LEN_lo, payload...], so payload byte j is
-                // frame byte (2 + j); take the last codeword of it for reveal time.
-                const wireIdx = (2 + j + 1) * per - 1;
+            // A multi-byte character isn't readable until its last byte lands,
+            // and it's only as healthy as the worst byte it's made of.
+            for (const { char, firstByte, lastByte } of decodeTextWithSpans(decoded.payload)) {
+                // Frame is [LEN_hi, LEN_lo, payload...], so payload byte b is
+                // frame byte (2 + b); take the last codeword of it for reveal time.
+                const wireIdx = (2 + lastByte + 1) * per - 1;
                 const frame = frames[wireIdx];
                 const time = frame
                     ? frame.center / this.sampleRate
-                    : dataStartAbs / this.sampleRate + (j + 1) * 10 * this.BIT_DURATION;
-                const ch = String.fromCharCode(decoded.payload[j]);
-                const status = decoded.byteStatuses[j] || 'ok';
-                events.push({ time, fn: () => onCharacter(ch, status) });
+                    : dataStartAbs / this.sampleRate + (wireIdx + 1) * 10 * this.BIT_DURATION;
+                let status = 'ok';
+                for (let b = firstByte; b <= lastByte; b++) {
+                    status = _FEC.worstStatus(status, decoded.byteStatuses[b] || 'ok');
+                }
+                events.push({ time, fn: () => onCharacter(char, status) });
             }
         }
         events.sort((a, b) => a.time - b.time);
@@ -716,15 +769,19 @@ class Bell202Modem {
             let x = (wire[i] ^ rxBytes[i]) & 0xFF;
             while (x) { bitErrors += x & 1; x >>= 1; }
         }
-        bitErrors += Math.abs(wire.length - rxBytes.length) * 8;  // dropped/extra bytes
+        // Only a shortfall is an error: the receiver reads past the frame into
+        // the trailing mark by design, and that junk isn't line damage.
+        bitErrors += Math.max(0, wire.length - rxBytes.length) * 8;
         return {
             sent: sentText,
-            decoded: String.fromCharCode(...decoded.payload),
+            decoded: decodeText(decoded.payload),
             fec,
             noiseLevel,
             bitErrors,
             corrected: decoded.corrected,
             uncorrectable: decoded.uncorrectable,
+            framingErrors: decoded.framingErrors,
+            truncated: decoded.truncated,
             crcOk: decoded.crcOk
         };
     }

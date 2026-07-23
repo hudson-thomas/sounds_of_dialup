@@ -12,11 +12,23 @@
  *      lock onto it, then sample the 10 bits (start + 8 data + stop) at their
  *      centres. Re-syncing per byte tolerates noise and small timing drift.
  *   3. Framing check — the start bit must be space and the stop bit mark; if
- *      not, the byte is flagged so the upper layers know the frame is suspect.
+ *      not, the byte is flagged so the upper layers know the frame is suspect
+ *      (see `framing` in FEC.decodeFrame, which folds this into byte statuses).
+ *
+ * Frame sync is also recovered from the audio, not supplied by the transmitter:
+ * findDataStart() hunts for the mark preamble — a long run of unbroken mark that
+ * only occurs between the channel seizure and the first data byte — and returns
+ * the mark->space edge that ends it. All the receiver is told is roughly where
+ * carrier begins, which is exactly what a real modem's carrier-detect gives it.
  *
  * Because it reads the actual (optionally noisy) waveform, demodulation can and
  * does fail under heavy noise — which is the whole point of the FEC/CRC above it.
  */
+
+// Blind-sync tuning: how many candidate start edges to consider, and how many
+// bytes to probe when judging each one.
+const MAX_SYNC_CANDIDATES = 32;
+const SYNC_PROBE_BYTES = 4;
 
 class Bell202Demodulator {
     constructor({ sampleRate = 44100, markFreq = 1200, spaceFreq = 2200, baud = 1200 } = {}) {
@@ -74,13 +86,79 @@ class Bell202Demodulator {
     }
 
     /**
+     * Blind frame sync: locate the first data start bit at/after `from`.
+     *
+     * The transmitter's preamble is a long unbroken run of mark (130ms ≈ 156
+     * bits). Nothing else in the signal looks like that — the channel seizure
+     * that precedes it alternates every single bit — so a sustained mark run is
+     * an unambiguous "data is about to start" marker. Once we've seen enough of
+     * it, the next confirmed space is the first start bit.
+     *
+     * Scans at half-bit resolution and requires the space to persist for two
+     * consecutive steps, so an impulse crackle inside the preamble can't fake a
+     * start bit. Returns a sub-sample edge position, or -1 if sync failed.
+     */
+    findDataStart(samples, from = 0, limit = samples.length, minMarkBits = 4) {
+        const step = this.samplesPerBit / 2;
+        const needMarkSteps = Math.ceil(minMarkBits * 2);
+        const end = Math.min(limit, samples.length - this.windowLen);
+
+        // Gather every plausible "long mark, then space" edge. On a noisy line an
+        // impulse crackle inside the preamble looks exactly like a start bit, so
+        // we can't just take the first one — we collect and then adjudicate.
+        const candidates = [];
+        let markRun = 0;
+        for (let c = Math.max(from, this.windowLen / 2); c <= end; c += step) {
+            if (this.discriminator(samples, c) > 0) { markRun++; continue; }
+            if (markRun >= needMarkSteps) {
+                const edge = this.findStartEdge(samples, c - step, c);
+                candidates.push(edge >= 0 ? edge : c - step / 2);
+                if (candidates.length >= MAX_SYNC_CANDIDATES) break;
+            }
+            markRun = 0;
+        }
+        if (candidates.length === 0) return -1;
+
+        // Adjudicate by UART plausibility: at the true start bit the following
+        // bytes all frame correctly, whereas a crackle-induced candidate is still
+        // inside the preamble, so the "start bits" after it read as mark and the
+        // framing check collapses. Take the earliest confident lock — a later
+        // candidate may frame just as well but has already lost leading bytes.
+        let best = candidates[0];
+        let bestScore = -1;
+        for (const candidate of candidates) {
+            const score = this.framingScore(samples, candidate, SYNC_PROBE_BYTES);
+            if (score >= SYNC_PROBE_BYTES - 1) return candidate;
+            if (score > bestScore) { bestScore = score; best = candidate; }
+        }
+        return best;
+    }
+
+    /** How many of the next `n` bytes at `start` have valid UART framing. */
+    framingScore(samples, start, n) {
+        const spb = this.samplesPerBit;
+        let score = 0;
+        for (let b = 0; b < n; b++) {
+            const frameStart = start + b * 10 * spb;
+            if (frameStart + 10 * spb > samples.length) break;
+            if (this.sampleBit(samples, frameStart + 0.5 * spb) === 0 &&
+                this.sampleBit(samples, frameStart + 9.5 * spb) === 1) {
+                score++;
+            }
+        }
+        return score;
+    }
+
+    /**
      * Demodulate UART 8-N-1 bytes starting around `dataStart`.
      * @param {Float32Array} samples
      * @param {number} dataStart   sample index of (roughly) the first start bit
-     * @param {number} maxBytes    stop after this many bytes
+     * @param {number} [maxBytes]  stop after this many bytes; omit to read until
+     *                             the samples run out (the frame's own LEN field
+     *                             then decides where the message actually ends)
      * @returns {{bytes: number[], frames: Array<{value:number, framingOk:boolean, center:number}>}}
      */
-    demodulate(samples, dataStart, maxBytes) {
+    demodulate(samples, dataStart, maxBytes = Infinity) {
         const spb = this.samplesPerBit;
         const search = Math.round(spb * 0.5);   // how far to hunt for each start edge
         const bytes = [];

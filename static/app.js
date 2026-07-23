@@ -100,6 +100,10 @@ class DialupEmulator {
         const parts = [`${stats.bitErrors} bit err`];
         if (stats.fec) parts.push(`${stats.corrected} corrected`);
         if (stats.uncorrectable) parts.push(`${stats.uncorrectable} uncorrectable`);
+        // Framing errors are the receiver's own verdict on bytes whose start/stop
+        // bits were wrong — the only damage signal available with FEC switched off.
+        if (stats.framingErrors) parts.push(`${stats.framingErrors} bad framing`);
+        if (stats.truncated) parts.push('LENGTH LOST');
         parts.push(stats.crcOk ? 'CRC OK' : 'CRC FAIL');
         this.decodeStats.textContent = parts.join(' · ');
         this.decodeStats.className = 'decode-stats ' + (stats.crcOk ? 'crc-ok' : 'crc-fail');
@@ -268,7 +272,13 @@ class DialupEmulator {
         this.isProcessingQueue = true;
         try {
             while (this.transmitQueue.length > 0) {
-                const text = this.transmitQueue.shift();
+                // Coalesce everything that piled up while the last transmission
+                // was playing. Each transmission carries its own channel seizure
+                // and preamble, so a single character still costs ~0.5s of audio
+                // — sending them one at a time means real-time mode fills the
+                // queue several times faster than it can drain, and falls further
+                // behind with every keystroke. Batching keeps it bounded.
+                const text = this.transmitQueue.splice(0, this.transmitQueue.length).join('');
                 await this.receiveTransmission(text);
             }
         } finally {
