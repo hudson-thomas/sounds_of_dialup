@@ -14,6 +14,11 @@
  * With FEC disabled the frame is sent raw — the CRC still detects corruption
  * but nothing can be repaired, which is exactly what makes the toggle a useful
  * demonstration.
+ *
+ * The decoder also accepts the demodulator's per-wire-byte UART framing verdict
+ * (see `framing` in decodeFrame). That is independent evidence of damage: it
+ * marks bytes the *receiver itself* knows are suspect, which is the only damage
+ * signal available at all when FEC is switched off.
  */
 
 // ---- CRC-16-CCITT (poly 0x1021, init 0xFFFF) -------------------------------
@@ -95,6 +100,12 @@ function hammingDecode(byte) {
 
 /**
  * Build the on-the-wire byte stream for a payload.
+ *
+ * Every element must already be a byte (0..255) — callers hand us the output of
+ * a UTF-8 encoder, not raw code units. We validate rather than mask: silently
+ * truncating an out-of-range value would corrupt the message *before* the CRC
+ * is computed over it, so the CRC would then certify the corruption as healthy.
+ *
  * @param {Uint8Array|number[]} payload  bytes to send (length <= 65535)
  * @param {{fec?: boolean}} opts
  * @returns {Uint8Array}
@@ -102,6 +113,12 @@ function hammingDecode(byte) {
 function encodeFrame(payload, { fec = true } = {}) {
     const bytes = Array.from(payload);
     if (bytes.length > 0xFFFF) throw new Error('payload too long (max 65535 bytes)');
+    for (let i = 0; i < bytes.length; i++) {
+        const b = bytes[i];
+        if (!Number.isInteger(b) || b < 0 || b > 255) {
+            throw new RangeError(`payload[${i}] = ${b} is not a byte (0..255)`);
+        }
+    }
 
     const frame = [(bytes.length >> 8) & 0xFF, bytes.length & 0xFF, ...bytes];
     const crc = crc16(frame);
@@ -117,61 +134,98 @@ function encodeFrame(payload, { fec = true } = {}) {
     return Uint8Array.from(out);
 }
 
+/** Worst of two per-byte health verdicts ('ok' < 'corrected' < 'error'). */
+function worstStatus(a, b) {
+    if (a === 'error' || b === 'error') return 'error';
+    if (a === 'corrected' || b === 'corrected') return 'corrected';
+    return 'ok';
+}
+
 /**
  * Decode an on-the-wire byte stream back into a payload.
+ *
+ * A garbled LEN field must never black out the whole message: LEN is clamped to
+ * what actually arrived, so the receiver still shows every byte it managed to
+ * recover (with crcOk false and `truncated` set). Reporting nothing at all is
+ * the least informative possible response to a damaged line.
+ *
  * @param {Uint8Array|number[]} wire  demodulated bytes (may contain bit errors)
- * @param {{fec?: boolean}} opts
+ * @param {{fec?: boolean, framing?: boolean[]}} opts
+ *   framing[i] — the demodulator's UART framing verdict for wire byte i
+ *   (false = start/stop bits were wrong, so this byte is untrustworthy).
  * @returns {{
- *   payload: Uint8Array, crcOk: boolean, corrected: number, uncorrectable: number,
+ *   payload: Uint8Array, crcOk: boolean, truncated: boolean,
+ *   corrected: number, uncorrectable: number, framingErrors: number,
  *   byteStatuses: string[]   // per payload byte: 'ok'|'corrected'|'error'
  * }}
  */
-function decodeFrame(wire, { fec = true } = {}) {
+function decodeFrame(wire, { fec = true, framing = null } = {}) {
     const wireBytes = Array.from(wire);
-    let frameBytes;
-    let frameStatuses;
-    let corrected = 0;
-    let uncorrectable = 0;
+    const frameBytes = [];
+    const hammingStatuses = [];   // per frame byte: worst of its codewords
+    const framingOk = [];         // per frame byte
+    const nCorrected = [];        // per frame byte: codewords repaired in it
+    const nUncorrectable = [];    // per frame byte: codewords beyond repair
+
+    // A wire byte with no framing verdict is treated as trustworthy.
+    const framedOk = (i) => !framing || framing[i] !== false;
 
     if (fec) {
-        frameBytes = [];
-        frameStatuses = [];
+        // Two codewords (high nibble, low nibble) per frame byte.
         for (let i = 0; i + 1 < wireBytes.length; i += 2) {
             const hi = hammingDecode(wireBytes[i]);
             const lo = hammingDecode(wireBytes[i + 1]);
-            for (const s of [hi.status, lo.status]) {
-                if (s === 'corrected') corrected++;
-                else if (s === 'error') uncorrectable++;
-            }
             frameBytes.push(((hi.nibble << 4) | lo.nibble) & 0xFF);
-            // A byte is only as healthy as its worst nibble.
-            frameStatuses.push(
-                (hi.status === 'error' || lo.status === 'error') ? 'error'
-                    : (hi.status === 'corrected' || lo.status === 'corrected') ? 'corrected'
-                        : 'ok');
+            // A byte is only as healthy as its worst nibble, but the damage
+            // tallies stay at codeword resolution — that's the interesting number.
+            hammingStatuses.push(worstStatus(hi.status, lo.status));
+            nCorrected.push([hi.status, lo.status].filter((s) => s === 'corrected').length);
+            nUncorrectable.push([hi.status, lo.status].filter((s) => s === 'error').length);
+            framingOk.push(framedOk(i) && framedOk(i + 1));
         }
     } else {
-        frameBytes = wireBytes.slice();
-        frameStatuses = frameBytes.map(() => 'ok');
+        for (let i = 0; i < wireBytes.length; i++) {
+            frameBytes.push(wireBytes[i] & 0xFF);
+            hammingStatuses.push('ok');
+            nCorrected.push(0);
+            nUncorrectable.push(0);
+            framingOk.push(framedOk(i));
+        }
     }
 
-    const result = { payload: new Uint8Array(0), crcOk: false, corrected, uncorrectable, byteStatuses: [] };
+    const result = {
+        payload: new Uint8Array(0), crcOk: false, truncated: false,
+        corrected: 0, uncorrectable: 0, framingErrors: 0, byteStatuses: []
+    };
     if (frameBytes.length < 4) return result;
 
-    const len = (frameBytes[0] << 8) | frameBytes[1];
-    if (frameBytes.length < len + 4) return result;  // truncated / garbled length
+    // Trust LEN only as far as the bytes we actually received.
+    const declaredLen = (frameBytes[0] << 8) | frameBytes[1];
+    const len = Math.min(declaredLen, frameBytes.length - 4);
+    const truncated = len !== declaredLen;
+    const frameLen = len + 4;
 
-    const payload = frameBytes.slice(2, 2 + len);
+    // Damage counts describe the frame we decoded, not any trailing junk that
+    // the demodulator read past the end of it.
+    for (let i = 0; i < frameLen; i++) {
+        result.corrected += nCorrected[i];
+        result.uncorrectable += nUncorrectable[i];
+        if (!framingOk[i]) result.framingErrors++;
+    }
+
     const crcRx = (frameBytes[2 + len] << 8) | frameBytes[3 + len];
     const crcCalc = crc16(frameBytes.slice(0, 2 + len));
 
-    result.payload = Uint8Array.from(payload);
-    result.crcOk = crcRx === crcCalc;
-    result.byteStatuses = frameStatuses.slice(2, 2 + len);
+    result.payload = Uint8Array.from(frameBytes.slice(2, 2 + len));
+    result.truncated = truncated;
+    // A clamped frame's last two bytes aren't really the CRC, so it can't pass.
+    result.crcOk = !truncated && crcRx === crcCalc;
+    result.byteStatuses = hammingStatuses.slice(2, 2 + len).map(
+        (s, j) => framingOk[2 + j] ? s : 'error');
     return result;
 }
 
-const FEC = { crc16, hammingEncode, hammingDecode, encodeFrame, decodeFrame };
+const FEC = { crc16, hammingEncode, hammingDecode, encodeFrame, decodeFrame, worstStatus };
 
 if (typeof window !== 'undefined') window.FEC = FEC;
 if (typeof module !== 'undefined' && module.exports) module.exports = FEC;
